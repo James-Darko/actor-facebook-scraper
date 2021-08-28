@@ -1,6 +1,6 @@
 import Apify from 'apify';
 import { InfoError } from './error';
-import { LABELS, CSS_SELECTORS, MOBILE_HOST } from './constants';
+import { LABELS, CSS_SELECTORS, MOBILE_HOST, DESKTOP_ADDRESS } from './constants';
 import * as fns from './functions';
 import {
     getPagesFromListing,
@@ -87,27 +87,27 @@ Apify.main(async () => {
         throw new Error('You must provide a finite number for "maxPostComments" input');
     }
 
-    const proxyConfig = await proxyConfiguration({
-        proxyConfig: input.proxyConfiguration,
-        hint: ['RESIDENTIAL'],
-        required: true,
-    });
+    // const proxyConfig = await proxyConfiguration({
+    //     proxyConfig: input.proxyConfiguration,
+    //     hint: ['RESIDENTIAL'],
+    //     required: true,
+    // });
 
-    const residentialWarning = () => {
-        if (Apify.isAtHome() && !proxyConfig?.groups?.includes('RESIDENTIAL')) {
-            log.warning(`!!!!!!!!!!!!!!!!!!!!!!!\n\nYou're not using RESIDENTIAL proxy group, it won't work as expected. Contact support@apify.com or on Intercom to give you proxy trial\n\n!!!!!!!!!!!!!!!!!!!!!!!`);
-        }
-    };
+    // const residentialWarning = () => {
+    //     if (Apify.isAtHome() && !proxyConfig?.groups?.includes('RESIDENTIAL')) {
+    //         log.warning(`!!!!!!!!!!!!!!!!!!!!!!!\n\nYou're not using RESIDENTIAL proxy group, it won't work as expected. Contact support@apify.com or on Intercom to give you proxy trial\n\n!!!!!!!!!!!!!!!!!!!!!!!`);
+    //     }
+    // };
+    //
+    //
+    // const shaderError = () => {
+    //     if (Apify.isAtHome() && proxyConfig?.groups?.includes('SHADER')) {
+    //         throw new Error(`Scraping Facebook with SHADER proxy group is not allowed! Please use RESIDENTIAL proxy group. Contact our support team through the Intercom widget that should appear on the bottom right corner of your screen for help.`);
+    //     }
+    // };
 
-
-    const shaderError = () => {
-        if (Apify.isAtHome() && proxyConfig?.groups?.includes('SHADER')) {
-            throw new Error(`Scraping Facebook with SHADER proxy group is not allowed! Please use RESIDENTIAL proxy group. Contact our support team through the Intercom widget that should appear on the bottom right corner of your screen for help.`);
-        }
-    };
-
-    residentialWarning();
-    shaderError();
+    // residentialWarning();
+    // shaderError();
 
     let handlePageTimeoutSecs = Math.round(60 * (((maxPostComments + maxPosts) || 10) * 0.08)) + 600; // minimum 600s
 
@@ -168,9 +168,9 @@ Apify.main(async () => {
         throw new Error('No requests were loaded from startUrls');
     }
 
-    if (proxyConfig?.groups?.includes('RESIDENTIAL')) {
-        proxyConfig.countryCode = countryCode ? language.split('-')?.[1] ?? 'US' : 'US';
-    }
+    // if (proxyConfig?.groups?.includes('RESIDENTIAL')) {
+    //     proxyConfig.countryCode = countryCode ? language.split('-')?.[1] ?? 'US' : 'US';
+    // }
 
     log.info(`Using language "${(LANGUAGES as any)[language]}" (${language})`);
 
@@ -329,11 +329,11 @@ Apify.main(async () => {
         },
         maxRequestRetries: 10,
         maxConcurrency,
-        proxyConfiguration: proxyConfig,
         launchContext: {
             launchOptions: {
                 devtools: debugLog,
-                headless: false,
+                headless: input.headless,
+                args: ['--proxy-server=' + input.proxyConfiguration.proxyUrls[0], '--no-sandbox'],
             },
         },
         browserPoolOptions: {
@@ -617,42 +617,82 @@ Apify.main(async () => {
                             break;
                         // Posts
                         case 'posts': {
-                            let max = maxPosts;
-                            let date = postDate;
+                            if ((await page.mainFrame().title()) === 'Page Not Found') {
+                                const url = `https://www.facebook.com/${username}`
+                                await requestQueue.addRequest({
+                                    url,
+                                    userData: {
+                                        override: request.userData.override,
+                                        label: LABELS.PAGE,
+                                        sub: 'posts',
+                                        ref: request.url,
+                                        useMobile: false,
+                                    },
+                                }, { forefront: true });
+                            } else {
+                                let max = maxPosts;
+                                let date = postDate;
 
-                            const { overriden, settings } = overrideUserData(input, request);
+                                const { overriden, settings } = overrideUserData(input, request);
 
-                            if (overriden) {
-                                if (settings?.maxPosts) {
-                                    max = settings.maxPosts;
+                                if (overriden) {
+                                    if (settings?.maxPosts) {
+                                        max = settings.maxPosts;
+                                    }
+
+                                    if (settings?.maxPostDate || settings?.minPostDate) {
+                                        date = minMaxDates({
+                                            min: settings.maxPostDate,
+                                            max: settings.minPostDate,
+                                        });
+                                    }
                                 }
 
-                                if (settings?.maxPostDate || settings?.minPostDate) {
-                                    date = minMaxDates({
-                                        min: settings.maxPostDate,
-                                        max: settings.minPostDate,
+                                const posts = await getPostUrls(page, {
+                                    max,
+                                    date,
+                                    username,
+                                    requestQueue,
+                                    request,
+                                    minPosts,
+                                });
+
+                                if (maxPosts && minPosts && posts.length < minPosts) {
+                                    throw new InfoError(`Minimum post count of ${minPosts} not met, retrying...`, {
+                                        namespace: 'threshold',
+                                        url: page.url(),
                                     });
                                 }
+
+                                if (input.postsMode === "URL_ONLY") {
+                                    for (const post of posts) {
+                                        await map.append(username, async (value) => {
+                                            return {
+                                                ...value,
+                                                posts: [
+                                                    post,
+                                                    ...(value?.posts ?? []),
+                                                ],
+                                            } as Partial<FbPage>;
+                                        });
+                                    }
+                                } else {
+                                    for (const post of posts) {
+                                        await requestQueue.addRequest({
+                                            url: post.parsed.toString(),
+                                            uniqueKey: `post-${post.id}`,
+                                            userData: {
+                                                override: request.userData.override,
+                                                postId: post.id,
+                                                label: LABELS.POST,
+                                                useMobile: false,
+                                                username,
+                                                canonical: post.postUrl,
+                                            },
+                                        });
+                                    }
+                                }
                             }
-
-                            // We don't do anything here, we enqueue posts to be
-                            // read on their own phase/label
-                            const postCount = await getPostUrls(page, {
-                                max,
-                                date,
-                                username,
-                                requestQueue,
-                                request,
-                                minPosts,
-                            });
-
-                            if (maxPosts && minPosts && postCount < minPosts) {
-                                throw new InfoError(`Minimum post count of ${minPosts} not met, retrying...`, {
-                                    namespace: 'threshold',
-                                    url: page.url(),
-                                });
-                            }
-
                             break;
                         }
                         // Reviews if any
@@ -846,7 +886,7 @@ Apify.main(async () => {
         await extendOutputFunction(page, {});
     }
 
-    residentialWarning();
+    // residentialWarning();
 
     log.info(`Done in ${Math.round(elapsed() / 60000)}m!`);
 });

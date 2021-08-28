@@ -2,7 +2,17 @@ import Apify from 'apify';
 import type { Page, Response as HTTPResponse } from 'playwright';
 import DelayAbort, { AbortError } from 'delayable-idle-abort-promise';
 import get = require('lodash.get');
-import type { FbPageInfo, FbPost, FbPage, FbGraphQl, FbComment, FbCommentsMode, FbReview, FbService } from './definitions';
+import type {
+    FbPageInfo,
+    FbPost,
+    FbPage,
+    FbGraphQl,
+    FbComment,
+    FbCommentsMode,
+    FbReview,
+    FbService,
+    FbFT
+} from './definitions';
 import {
     deferred,
     pageSelectors,
@@ -19,6 +29,7 @@ import {
 } from './functions';
 import { CSS_SELECTORS, DESKTOP_ADDRESS, LABELS, PSN_POST_TYPE_BLACKLIST } from './constants';
 import { InfoError } from './error';
+import { randomInt } from "crypto";
 
 const { log, sleep } = Apify.utils;
 
@@ -190,6 +201,35 @@ export const getPagesFromSearch = async function* (page: Page, searchLimit: numb
     }
 };
 
+function isRootPage(page: Page, username: string): boolean {
+    return page.url().endsWith(`facebook.com/${username}`);
+}
+
+async function triggerPostLinks(page: Page): Promise<void> {
+    let articles = await page.$$(`//div[@role="article"]`)
+    for (const article of articles) {
+        const hrefTrigger = await article.$$('xpath=.//a[@href="#"]')
+        for (const trigger of hrefTrigger) {
+            const classes = await page.evaluate(elem => elem.classList, trigger)
+            if (!classes[15]) continue;
+            const label = await page.evaluate(elem => elem.getAttribute("aria-label"), trigger);
+            if (!(/\d*/).test(label)) continue;
+            try {
+                await trigger.hover()
+            } catch (e) {}
+            const box = await trigger.boundingBox()
+            if (box != null) {
+                await page.mouse.click(box.x + 7, box.y + 7, {button: "right"})
+                await new Promise(r => setTimeout(r, randomInt(100, 200)));
+                await page.mouse.click(box.x + 100, box.y + 7, {button: "right"})
+            }
+            await new Promise(r => setTimeout(r, randomInt(100, 200)));
+        }
+    }
+}
+
+export type Post = {postUrl: string, requestUrl: string, date: Date, id: string, parsed: URL}
+
 /**
  * Get posts until it reaches the given max
  */
@@ -204,7 +244,7 @@ export const getPostUrls = async (page: Page, {
     minPosts?: number;
 }) => {
     if (!max) {
-        return 0;
+        return [];
     }
 
     const urls = new Set<string>(request.userData.urls);
@@ -217,9 +257,48 @@ export const getPostUrls = async (page: Page, {
 
     const counter = dateRangeItemCounter(date);
 
-    const getPosts = async () => {
+    const rPosts: Post[] = [];
+
+    const rootPostLink = `//a[contains(@href, "https://www.facebook.com/${username}/posts/")]`;
+    const isRoot = isRootPage(page, username);
+    const pushPosts = async () => {
         try {
-            const posts = await pageSelectors.posts(page, scrollingSleep * 2);
+            let posts: {ft: FbFT, url: string, isPinned: boolean}[];
+            if (isRoot) {
+                posts = []
+                const idSet = new Set<string>();
+                for (let attempts = 0; attempts < 8;) {
+                    await triggerPostLinks(page);
+
+                    await page.$$(rootPostLink); // running it twice finds more posts for some reason.
+                    const postElem = await page.$$(rootPostLink);
+
+                    for (const elem of postElem) {
+                        const href = (await page.evaluate(elem => elem.getAttribute("href"), elem))!;
+                        if (!href.includes("?__cft__[0]=")) { // not an actual post
+                            continue;
+                        }
+                        const url = href.substr(0, href.indexOf("?"));
+                        const id = url.substring(url.lastIndexOf("/") + 1, url.length);
+
+                        if (!idSet.has(id)) {
+                            posts.push({
+                                publishedTime: Date.now(),
+                                url,
+                                isPinned: false,
+                                postId: id
+                            });
+                            idSet.add(id)
+                        }
+                    }
+                    if (posts.length >= max) break;
+                    attempts++
+                    await sleep(1000)
+                }
+            } else {
+                posts = await pageSelectors.posts(page, scrollingSleep * 2);
+            }
+
             counter.empty(!posts.length);
             counter.add(posts.length);
 
@@ -242,20 +321,28 @@ export const getPostUrls = async (page: Page, {
                     return;
                 }
 
-                const { top_level_post_id, story_attachment_style, page_id, page_insights } = ft ?? {};
+                let top_level_post_id = ft?.top_level_post_id ?? url.slice(url.lastIndexOf("/") + 1, url.length);
+                const { story_attachment_style, page_id, page_insights } = ft ?? {};
 
-                if (story_attachment_style === 'scheduled_live_video_post' // skip scheduled live
+                if ((story_attachment_style === 'scheduled_live_video_post' // skip scheduled live
                     || !top_level_post_id
                     || !page_id
                     || !page_insights
                     || !page_insights?.[page_id]?.psn
                     || !page_insights?.[page_id]?.post_context?.publish_time
-                    || PSN_POST_TYPE_BLACKLIST.includes(page_insights[page_id].psn)
+                    || PSN_POST_TYPE_BLACKLIST.includes(page_insights[page_id].psn))
+                    && !isRoot
                 ) {
                     continue; // eslint-disable-line
                 }
 
-                const convertedDate = convertDate(page_insights[page_id].post_context.publish_time);
+
+                let convertedDate;
+                if (page_insights) {
+                    convertedDate = convertDate(page_insights[page_id].post_context.publish_time);
+                } else {
+                    convertedDate = new Date().toISOString()
+                }
                 const inDateRange = !isPinned
                     ? counter.time(convertedDate)
                     : date.compare(convertedDate); // skip increasing metrics for pinned posts
@@ -277,20 +364,20 @@ export const getPostUrls = async (page: Page, {
 
                     urls.add(parsed.toString());
 
-                    await requestQueue.addRequest({
-                        url: parsed.toString(),
-                        uniqueKey: `post-${top_level_post_id || story_fbid}`,
-                        userData: {
-                            override: request.userData.override,
-                            postId: top_level_post_id || story_fbid,
-                            label: LABELS.POST,
-                            useMobile: false,
-                            username,
-                            canonical: `${DESKTOP_ADDRESS}/${username}/${top_level_post_id || story_fbid
-                                ? `posts/${top_level_post_id || story_fbid}`
-                                : parsed.pathname.split(/\/(photos|videos)\//).slice(1).join('/')
-                            }`,
-                        },
+                    const id = (top_level_post_id || story_fbid)!;
+
+                    const canonical = `${DESKTOP_ADDRESS}/${username}/${top_level_post_id || story_fbid
+                        ? `posts/${id}`
+                        : parsed.pathname.split(/\/(photos|videos)\//).slice(1).join('/')
+                    }`;
+                    const postDateTime = new Date(convertedDate);
+
+                    rPosts.push({
+                        postUrl: canonical,
+                        id,
+                        requestUrl: parsed.toString(),
+                        date: postDateTime,
+                        parsed
                     });
                 }
             }
@@ -340,7 +427,72 @@ export const getPostUrls = async (page: Page, {
 
     page.on('response', interceptAjax);
 
+// document.evaluate( 'count(//a[contains(@href, "https://www.facebook.com/paulkennyofficial/posts")])', document, null, XPathResult.ANY_TYPE, null );
     try {
+        if (isRoot) {
+            let timeoutSeconds = 30;
+            new Promise(async (resolve, _) => {
+                while(!finish.resolved) {
+                    try {
+
+                        const cookieAccept = '//div[@aria-label="Accept All"]';
+                        const closeDialog = '//div[@aria-label="Close"]';
+                        let elem = await page.$(closeDialog);
+                        if (!elem) {
+                            elem = await Promise.race([
+                                await page.waitForSelector(closeDialog, {timeout: 1000}),
+                                await page.waitForSelector(cookieAccept, {timeout: 10000})
+                            ]);
+                        }
+
+                        const logClick = async () => {
+                            log.debug("Closed dialog")
+                            await sleep(250)
+                        };
+                        const label = await page.evaluate((elem) => elem.getAttribute("aria-label"), elem);
+                        if (label === "Close") {
+                            const maybeCookieAccept = await page.$(cookieAccept);
+                            if (maybeCookieAccept) {
+                                await maybeCookieAccept.click();
+                                await logClick()
+                            } else {
+                                await (await page.$(closeDialog))?.click()
+                                await logClick()
+                            }
+                        } else {
+                            await elem.click();
+                            await logClick()
+                        }
+
+                    } catch (e) {
+                        if (e.name !== 'TimeoutError' && !e.message.includes('waiting for selector "//div[@aria-label="Close"]" to be visible')) {
+                            console.error("error while trying to close dialog")
+                            console.error(e)
+                        }
+                    }
+                }
+                resolve(null)
+            })
+            let found = false;
+            for (let counter = 0; counter < timeoutSeconds + 1; counter++) {
+                await triggerPostLinks(page);
+                const post = await page.$(rootPostLink);
+                if (post) {
+                    found = true
+                    break;
+                }
+                await sleep(1000)
+            }
+
+            if (!found) {
+                // noinspection ExceptionCaughtLocallyJS
+                throw new InfoError('Failed to find any posts', {
+                    namespace: 'getPostUrls',
+                    url: currentUrl,
+                });
+            }
+        }
+
         let lastCount = 0;
         let stillLoading = 0;
 
@@ -368,14 +520,21 @@ export const getPostUrls = async (page: Page, {
                     }
 
                     try {
-                        await page.waitForSelector('#pages_msite_body_contents [data-sigil*="loading"]:not([style])', {
-                            timeout: 1000,
-                            state: 'attached',
-                        });
+                        if (isRoot) {
+                            await page.waitForSelector(`//div[@role="article"]/div[@role="progressbar"]`,{
+                                timeout: 1000,
+                                state: "visible"
+                            })
+                        } else {
+                            await page.waitForSelector('#pages_msite_body_contents [data-sigil*="loading"]:not([style])', {
+                                timeout: 1000,
+                                state: 'attached',
+                            })
+                        }
 
                         stillLoading = 0;
 
-                        await getPosts();
+                        await pushPosts();
 
                         if (lastCount < urls.size) {
                             lastCount = urls.size;
@@ -383,6 +542,7 @@ export const getPostUrls = async (page: Page, {
                         }
                     } catch (e) {
                         if (e.name === 'TimeoutError') {
+                            console.log("scroll timeout")
                             stillLoading++;
                             if (urls.size === 0 && stillLoading > 15) {
                                 finish.reject(new InfoError(`Posts are not loading`, {
@@ -426,8 +586,7 @@ export const getPostUrls = async (page: Page, {
     }
 
     log.info(`Got ${urls.size} posts in ${start() / 1000}s`, { username, url: currentUrl });
-
-    return urls.size;
+    return rPosts;
 };
 
 /**

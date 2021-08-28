@@ -1,5 +1,6 @@
 export type FbSection = 'home' | 'posts' | 'about' | 'reviews' | 'services';
 export type FbLabel = 'LISTING' | 'PAGE' | 'POST' | 'PHOTO' | 'SEARCH';
+export type FbPostMode = 'FULL' | 'URL_ONLY'
 export type FbCommentsMode = 'RANKED_THREADED' | 'RECENT_ACTIVITY' | 'RANKED_UNFILTERED';
 export type FbMap = Map<string, Partial<FbPage>>;
 
@@ -62,6 +63,7 @@ export interface FbGraphQl {
 export interface Schema {
     startUrls: Array<string | { url: string }>;
     proxyConfiguration?: any;
+    headless: boolean;
     maxPosts?: number;
     maxPostDate?: string;
     minPostDate?: string;
@@ -73,6 +75,8 @@ export interface Schema {
     scrapeAbout?: boolean;
     scrapeReviews?: boolean;
     scrapePosts?: boolean;
+    postsMode?: FbPostMode;
+    scrapePagePostUrls?: boolean;
     countryCode?: boolean;
     scrapeServices?: boolean;
     language?: string;
